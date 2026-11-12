@@ -56,21 +56,21 @@ HTTP_VERSION_MAP = {
 
 
 def make_scope(flow: http.HTTPFlow) -> dict:
-    # %3F is a quoted question mark
-    quoted_path = urllib.parse.quote_from_bytes(flow.request.data.path).split(
-        "%3F", maxsplit=1
-    )
+    # (byte string) – The original HTTP path component, excluding any query string.
+    # (byte string) – URL portion after the ?, percent-encoded.
+    raw_path, _, query_string = flow.request.data.path.partition(b"?")
 
     # (Unicode string) – HTTP request target excluding any query string, with percent-encoded
     # sequences and UTF-8 byte sequences decoded into characters.
-    path = quoted_path[0]
+    path = urllib.parse.unquote(raw_path.decode("utf-8", "replace"))
 
-    # (byte string) – URL portion after the ?, percent-encoded.
-    query_string: bytes
-    if len(quoted_path) > 1:
-        query_string = urllib.parse.unquote(quoted_path[1]).encode()
-    else:
-        query_string = b""
+    headers = [(name.lower(), value) for (name, value) in flow.request.headers.fields]
+    if flow.request.data.authority and (flow.request.is_http2 or flow.request.is_http3):
+        # The :authority pseudo-header takes the place of the host header.
+        headers = [
+            (b"host", flow.request.data.authority),
+            *(h for h in headers if h[0] != b"host"),
+        ]
 
     return {
         "type": "http",
@@ -80,13 +80,11 @@ def make_scope(flow: http.HTTPFlow) -> dict:
         },
         "http_version": HTTP_VERSION_MAP.get(flow.request.http_version, "1.1"),
         "method": flow.request.method,
-        "scheme": flow.request.scheme.upper(),
+        "scheme": flow.request.scheme.lower(),
         "path": path,
-        "raw_path": flow.request.path,
+        "raw_path": raw_path,
         "query_string": query_string,
-        "headers": [
-            (name.lower(), value) for (name, value) in flow.request.headers.fields
-        ],
+        "headers": headers,
         "client": flow.client_conn.peername,
         "extensions": {
             "mitmproxy.master": ctx.master,

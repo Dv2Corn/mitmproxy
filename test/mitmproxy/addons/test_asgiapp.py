@@ -8,6 +8,7 @@ from mitmproxy.addons import asgiapp
 from mitmproxy.addons import next_layer
 from mitmproxy.addons.proxyserver import Proxyserver
 from mitmproxy.test import taddons
+from mitmproxy.test import tflow
 
 tapp = flask.Flask(__name__)
 
@@ -28,6 +29,19 @@ def request_check():
 @tapp.route("/requestbody", methods=["POST"])
 def request_body():
     return json.dumps({"body": request.data.decode()})
+
+
+@tapp.route("/user/<name>")
+def user(name):
+    return json.dumps(
+        {
+            "name": name,
+            "q": request.args["q"],
+            "host": request.host,
+            "scheme": request.scheme,
+            "is_secure": request.is_secure,
+        }
+    )
 
 
 @tapp.route("/error")
@@ -123,3 +137,46 @@ async def test_asgi_full(caplog):
 
         tctx.configure(ps, server=False)
         assert await ps.setup_servers()
+
+
+async def test_scope():
+    """The scope follows the ASGI spec, so that apps see the path and scheme the client requested."""
+    app = asgiapp.WSGIApp(tapp, "testapp", 443)
+    with taddons.context():
+        f = tflow.tflow()
+        f.request.scheme = "https"
+        f.request.path = "/user/J%C3%BCrgen%20M?q=a%20b%3Fc"
+        f.request.headers["Host"] = "testapp"
+
+        scope = asgiapp.make_scope(f)
+        assert scope["scheme"] == "https"
+        assert scope["path"] == "/user/Jürgen M"
+        assert scope["raw_path"] == b"/user/J%C3%BCrgen%20M"
+        assert scope["query_string"] == b"q=a%20b%3Fc"
+
+        await asgiapp.serve(app.asgi_app, f)
+        assert f.response
+        assert f.response.status_code == 200
+        assert json.loads(f.response.content) == {
+            "name": "Jürgen M",
+            "q": "a b?c",
+            "host": "testapp",
+            "scheme": "https",
+            "is_secure": True,
+        }
+
+        f.request.path = "/"
+        scope = asgiapp.make_scope(f)
+        assert scope["path"] == "/"
+        assert scope["raw_path"] == b"/"
+        assert scope["query_string"] == b""
+
+        # HTTP/2 has no host header, apps get :authority instead.
+        del f.request.headers["Host"]
+        assert b"host" not in dict(asgiapp.make_scope(f)["headers"])
+        f.request.http_version = "HTTP/2.0"
+        f.request.authority = "testapp:8443"
+        assert asgiapp.make_scope(f)["headers"][0] == (b"host", b"testapp:8443")
+        f.request.headers["host"] = "other"
+        assert asgiapp.make_scope(f)["headers"].count((b"host", b"testapp:8443")) == 1
+        assert (b"host", b"other") not in asgiapp.make_scope(f)["headers"]
